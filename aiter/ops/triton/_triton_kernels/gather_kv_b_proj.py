@@ -409,7 +409,15 @@ def _triton_gather_kv_b_proj_impl(
     ScaleKGranularity: tl.constexpr = 128
     ScaleNGranularity: tl.constexpr = 128
     KBlocksPerChunkK: tl.constexpr = ChunkK // KBlockSize
-    assert KV_CDim == 4 * ScaleKGranularity
+    # Quantized paths use four complete 128-wide scale groups. The unscaled,
+    # unshuffled BF16 path additionally supports Kimi-K3's 576-wide latent by
+    # masking a fifth, half-width MFMA segment.
+    assert (KV_CDim == 4 * ScaleKGranularity) or (
+        NO_SCALE
+        and KV_CDim == 4 * ScaleKGranularity + 64
+        and not WEIGHT_PRESHUFFLE
+        and not SHUFFLED_KV_CACHE
+    )
 
     # ===---------------------------------------------------
     # Workload Partition
@@ -514,6 +522,13 @@ def _triton_gather_kv_b_proj_impl(
             mask=k_mask_2d,
             other=0.0,
         ).to(k_type)
+        if KV_CDim > 4 * ScaleKGranularity:
+            tail_mask = offs_k < KV_CDim - 4 * ScaleKGranularity
+            k_nope_weight_4 = tl.load(
+                k_nope_weight_base_offset + 4 * ScaleKGranularity,
+                mask=k_mask_2d & tail_mask[None, :],
+                other=0.0,
+            ).to(k_type)
 
         v_nope_weight_base_offset = (
             v_head_base + offs_n_v[:, None] * KV_CDim + offs_k[None, :]
@@ -539,6 +554,13 @@ def _triton_gather_kv_b_proj_impl(
             mask=v_mask_2d,
             other=0.0,
         ).to(k_type)
+        if KV_CDim > 4 * ScaleKGranularity:
+            tail_mask = offs_k < KV_CDim - 4 * ScaleKGranularity
+            v_nope_weight_4 = tl.load(
+                v_nope_weight_base_offset + 4 * ScaleKGranularity,
+                mask=v_mask_2d & tail_mask[None, :],
+                other=0.0,
+            ).to(k_type)
 
     if (not NO_SCALE) and (not PER_ROW_SCALE):
         k_nope_scale_0 = tl.load(
@@ -658,6 +680,13 @@ def _triton_gather_kv_b_proj_impl(
             mask=row_mask,
             other=0.0,
         )
+        if KV_CDim > 4 * ScaleKGranularity:
+            tail_mask = offs_k < KV_CDim - 4 * ScaleKGranularity
+            kv_c_data_4 = tl.load(
+                k_buffer + kv_c_data_base_offset + 4 * CHUNK_STRIDE,
+                mask=row_mask & tail_mask[None, :],
+                other=0.0,
+            )
         if SHUFFLED_KV_CACHE:
             kv_pe_data = tl.load(
                 k_buffer
@@ -688,6 +717,9 @@ def _triton_gather_kv_b_proj_impl(
             accum_v = tl.dot(kv_c_data_2, v_nope_weight_2.T, acc=accum_v)
             accum_k = tl.dot(kv_c_data_3, k_nope_weight_3.T, acc=accum_k)
             accum_v = tl.dot(kv_c_data_3, v_nope_weight_3.T, acc=accum_v)
+            if KV_CDim > 4 * ScaleKGranularity:
+                accum_k = tl.dot(kv_c_data_4, k_nope_weight_4.T, acc=accum_k)
+                accum_v = tl.dot(kv_c_data_4, v_nope_weight_4.T, acc=accum_v)
         elif PER_ROW_SCALE:
             accum_k += (
                 tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]

@@ -36,11 +36,10 @@ def ref_gather_kv_b_proj(
 
     batch_size = kv_indptr.shape[0] - 1
 
-    kv_c_dim = 512
-    kv_pe_dim = 64
-
     _num_block, _block_size, hidden_dim = k_buffer.shape
     weight_n, weight_k = kv_proj_weight.shape
+    kv_c_dim = weight_k
+    kv_pe_dim = hidden_dim - kv_c_dim
     per_row_scale = kv_proj_scale.dim() == 1 or (
         kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
     )
@@ -666,6 +665,79 @@ def test_gather_kv_b_proj_bf16_weight(
             f"scale_mode {scale_mode}\n"
             f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
         )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_gather_kv_b_proj_kimi_k3_bf16_weight(batch_size):
+    """Validate Kimi-K3's unscaled BF16 [3072, 576] KV-B projection."""
+    torch.manual_seed(0)
+    random.seed(0)
+    block_size = 16
+    avg_kv_length = 512
+    kv_c_dim = 576
+    kv_pe_dim = 64
+    qk_nope_head_dim = 128
+    v_head_dim = 128
+    tp_k_head_num = 12
+    weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
+
+    (
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        _context_lens,
+        _num_block,
+    ) = _make_kv_test_data(
+        batch_size,
+        block_size,
+        avg_kv_length,
+        kv_c_dim,
+        kv_pe_dim,
+        torch.bfloat16,
+    )
+    kv_proj_weight = torch.randn(
+        (weight_n, kv_c_dim), device="cuda", dtype=torch.bfloat16
+    )
+    reference_scale = torch.ones(weight_n, device="cuda", dtype=torch.float32)
+    k_ref, v_ref = ref_gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        reference_scale,
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+    )
+
+    total_kv = int(kv_prefix_sum_context_lens[-1])
+    k_prefix = torch.empty(
+        (total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_prefix = torch.empty(
+        (total_kv, tp_k_head_num, v_head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        None,
+        k_prefix,
+        v_prefix,
+    )
+
+    checkAllclose(k_ref, k_prefix.view_as(k_ref), atol=1e-2, rtol=1e-2)
+    checkAllclose(v_ref, v_prefix.view_as(v_ref), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
